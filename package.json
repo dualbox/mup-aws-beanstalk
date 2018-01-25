@@ -1,5 +1,5 @@
 {
-  "name": "mup-aws-beanstalk",
+  "name": "@dualbox/mup-aws-beanstalk",
   "version": "0.3.0",
   "description": "Deploy apps to AWS Elastic Beanstalk using Meteor Up",
   "main": "index.js",

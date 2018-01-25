@@ -38,7 +38,7 @@ export function injectFiles(api, name, version, yumPackages, forceSSL, bundlePat
 
   const { nodeVersion, npmVersion } = getNodeVersion(api, bundlePath);
   sourcePath = api.resolvePath(__dirname, './assets/node.yaml');
-  destPath = api.resolvePath(bundlePath, 'bundle/.ebextensions/node.config');
+destPath = api.resolvePath(bundlePath, 'bundle/.ebextensions/node.config');
   copy(sourcePath, destPath, { nodeVersion, npmVersion });
 
   sourcePath = api.resolvePath(__dirname, './assets/nginx.yaml');
