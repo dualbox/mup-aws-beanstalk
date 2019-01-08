@@ -6,6 +6,11 @@ export let beanstalk = {};
 export let iam = {};
 export let autoScaling = {};
 export let acm = {};
+export let cloudTrail = {};
+export let cloudWatchEvents = {};
+export let sts = {};
+export let ssm = {};
+
 /* eslint-enable import/no-mutable-exports */
 
 export default function configure({ auth, name, region }) {
@@ -22,4 +27,8 @@ export default function configure({ auth, name, region }) {
   iam = new AWS.IAM({ apiVersion: '2010-05-08' });
   autoScaling = new AWS.AutoScaling({ apiVersion: '2011-01-01' });
   acm = new AWS.ACM({ apiVersion: '2015-12-08' });
+  cloudTrail = new AWS.CloudTrail({ apiVersion: '2013-11-01' });
+  sts = new AWS.STS({ apiVersion: '2011-06-15' });
+  cloudWatchEvents = new AWS.CloudWatchEvents({ apiVersion: '2015-10-07' });
+  ssm = new AWS.SSM({ apiVersion: '2014-11-06' });
 }

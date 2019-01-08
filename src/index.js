@@ -33,6 +33,12 @@ export function prepareConfig(config) {
 
   config.app.instanceType = config.app.instanceType || 't2.micro';
 
+  config.app.env = config.app.env || {};
+  config.app.env.PORT = 8081;
+  config.app.env.METEOR_SIGTERM_GRACE_PERIOD_SECONDS = 30;
+
+  config.app.oldVersions = config.app.oldVersions || 3;
+
   return config;
 }
 

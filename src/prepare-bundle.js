@@ -2,7 +2,7 @@ import archiver from 'archiver';
 import fs from 'fs';
 import ejs from 'ejs';
 import { round } from 'lodash';
-import { getNodeVersion, logStep } from './utils';
+import { getNodeVersion, logStep, names } from './utils';
 
 function copy(source, destination, vars = {}) {
   let contents = fs.readFileSync(source).toString();
@@ -12,7 +12,19 @@ function copy(source, destination, vars = {}) {
   fs.writeFileSync(destination, contents);
 }
 
-export function injectFiles(api, name, version, yumPackages, forceSSL, bundlePath) {
+export function injectFiles(api, name, version, appConfig) {
+  const {
+    yumPackages,
+    forceSSL,
+    gracefulShutdown,
+    buildOptions,
+    longEnvVars
+  } = appConfig;
+  const bundlePath = buildOptions.buildLocation;
+  const {
+    bucket
+  } = names({ app: appConfig });
+
   let sourcePath = api.resolvePath(__dirname, './assets/package.json');
   let destPath = api.resolvePath(bundlePath, 'bundle/package.json');
   copy(sourcePath, destPath, {
@@ -51,6 +63,20 @@ destPath = api.resolvePath(bundlePath, 'bundle/.ebextensions/node.config');
     copy(sourcePath, destPath, { packages: yumPackages });
   }
 
+  if (gracefulShutdown) {
+    sourcePath = api.resolvePath(__dirname, './assets/graceful_shutdown.yaml');
+    destPath = api.resolvePath(bundlePath, 'bundle/.ebextensions/graceful_shutdown.config');
+    copy(sourcePath, destPath);
+  }
+
+  if (longEnvVars) {
+    sourcePath = api.resolvePath(__dirname, './assets/env.yaml');
+    destPath = api.resolvePath(bundlePath, 'bundle/.ebextensions/env.config');
+    copy(sourcePath, destPath, {
+      bucketName: bucket
+    });
+  }
+
   sourcePath = api.resolvePath(__dirname, './assets/health-check.js');
   destPath = api.resolvePath(bundlePath, 'bundle/health-check.js');
   copy(sourcePath, destPath);
@@ -66,7 +92,6 @@ export function archiveApp(buildLocation, api) {
   }
 
   return new Promise((resolve, reject) => {
-    // log('starting archive');
     logStep('=> Archiving Bundle');
     const sourceDir = api.resolvePath(buildLocation, 'bundle');
 

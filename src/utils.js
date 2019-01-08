@@ -1,13 +1,13 @@
 import axios from 'axios';
 import chalk from 'chalk';
 import fs from 'fs';
-import random from 'random-seed';
+import { isEqual } from 'lodash';
 import os from 'os';
+import random from 'random-seed';
 import uuid from 'uuid';
-import {
-  iam,
-  beanstalk
-} from './aws';
+import { execSync } from 'child_process';
+import { beanstalk, cloudWatchEvents, iam, s3, sts, ssm } from './aws';
+import { getRecheckInterval } from './recheck';
 
 export function logStep(message) {
   console.log(chalk.blue(message));
@@ -36,14 +36,29 @@ export function tmpBuildPath(appPath, api) {
 }
 
 export function names(config) {
+  const name = config.app.name.toLowerCase();
+
   return {
-    bucket: `mup-${config.app.name}`,
-    environment: `mup-env-${config.app.name}`,
-    app: `mup-${config.app.name}`,
-    bundlePrefix: `mup/bundles/${config.app.name}/`,
+    bucket: `mup-${name}`,
+    environment: `mup-env-${name}`,
+    app: `mup-${name}`,
+    bundlePrefix: `mup/bundles/${name}/`,
     instanceProfile: 'aws-elasticbeanstalk-ec2-role',
-    serviceRole: 'aws-elasticbeanstalk-service-role'
+    serviceRole: 'aws-elasticbeanstalk-service-role',
+    trailBucketPrefix: 'mup-graceful-shutdown-trail',
+    trailName: 'mup-graceful-shutdown-trail',
+    deregisterRuleName: 'mup-target-deregister',
+    eventTargetRole: `mup-envoke-run-command-${name}`,
+    eventTargetPolicyName: 'Invoke_Run_Command',
+    eventTargetPassRoleName: 'Pass_Role',
+    automationDocument: 'mup-graceful-shutdown'
   };
+}
+
+export function createUniqueName(prefix = '') {
+  const randomNumbers = Math.floor(Math.random() * 10000);
+
+  return `${prefix}-${Date.now()}-${randomNumbers}`;
 }
 
 async function retrieveEnvironmentInfo(api, count) {
@@ -72,7 +87,7 @@ async function retrieveEnvironmentInfo(api, count) {
       retrieveEnvironmentInfo(api, count + 1)
         .then(resolve)
         .catch(reject);
-    }, 2000);
+    }, getRecheckInterval());
   });
 }
 
@@ -153,13 +168,29 @@ export async function attachPolicies(config, roleName, policies) {
   await Promise.all(promises);
 }
 
-export async function ensureRoleExists(config, name, assumeRolePolicyDocument) {
+export function getAccountId() {
+  return sts.getCallerIdentity()
+    .promise()
+    .then(({ Account }) => Account);
+}
+
+export async function ensureRoleExists(name, assumeRolePolicyDocument, ensureAssumeRolePolicy) {
   let exists = true;
+  let updateAssumeRolePolicy = false;
 
   try {
-    await iam.getRole({
+    const { Role } = await iam.getRole({
       RoleName: name
     }).promise();
+
+
+    const currentAssumeRolePolicy = decodeURIComponent(Role.AssumeRolePolicyDocument);
+    // Make the whitespace consistent with the current document
+    assumeRolePolicyDocument = JSON.stringify(JSON.parse(assumeRolePolicyDocument));
+
+    if (currentAssumeRolePolicy !== assumeRolePolicyDocument && ensureAssumeRolePolicy) {
+      updateAssumeRolePolicy = true;
+    }
   } catch (e) {
     exists = false;
   }
@@ -168,6 +199,11 @@ export async function ensureRoleExists(config, name, assumeRolePolicyDocument) {
     await iam.createRole({
       RoleName: name,
       AssumeRolePolicyDocument: assumeRolePolicyDocument
+    }).promise();
+  } else if (updateAssumeRolePolicy) {
+    await iam.updateAssumeRolePolicy({
+      RoleName: name,
+      PolicyDocument: assumeRolePolicyDocument
     }).promise();
   }
 }
@@ -234,6 +270,113 @@ export async function ensurePoliciesAttached(config, role, policies) {
   }
 }
 
+export async function ensureInlinePolicyAttached(role, policyName, policyDocument) {
+  let exists = true;
+  let needsUpdating = false;
+
+  try {
+    const result = await iam.getRolePolicy({
+      RoleName: role,
+      PolicyName: policyName
+    }).promise();
+    const currentPolicyDocument = decodeURIComponent(result.PolicyDocument);
+
+    if (currentPolicyDocument !== policyDocument) {
+      needsUpdating = true;
+    }
+  } catch (e) {
+    exists = false;
+  }
+
+  if (!exists || needsUpdating) {
+    await iam.putRolePolicy({
+      RoleName: role,
+      PolicyName: policyName,
+      PolicyDocument: policyDocument
+    }).promise();
+  }
+}
+
+export async function ensureBucketExists(buckets, bucketName, region) {
+  if (!buckets.find(bucket => bucket.Name === bucketName)) {
+    await s3.createBucket({
+      Bucket: bucketName,
+      ...(region ? {
+        CreateBucketConfiguration: {
+          LocationConstraint: region
+        }
+      } : {})
+    }).promise();
+
+    return true;
+  }
+}
+
+export function findBucketWithPrefix(buckets, prefix) {
+  return buckets.find(bucket => bucket.Name.indexOf(prefix) === 0);
+}
+
+export async function ensureBucketPolicyAttached(bucketName, policy) {
+  let error = false;
+  let currentPolicy;
+
+  try {
+    const { Policy } = await s3.getBucketPolicy({ Bucket: bucketName }).promise();
+    currentPolicy = Policy;
+  } catch (e) {
+    error = true;
+  }
+
+  if (error || currentPolicy !== policy) {
+    const params = {
+      Bucket: bucketName,
+      Policy: policy
+    };
+
+    await s3.putBucketPolicy(params).promise();
+  }
+}
+
+export async function ensureCloudWatchRule(name, description, eventPattern) {
+  let error = false;
+
+  try {
+    await cloudWatchEvents.describeRule({ Name: name }).promise();
+  } catch (e) {
+    error = true;
+  }
+
+  if (error) {
+    await cloudWatchEvents.putRule({
+      Name: name,
+      Description: description,
+      EventPattern: eventPattern
+    }).promise();
+
+    return true;
+  }
+
+  return false;
+}
+
+export async function ensureRuleTargetExists(ruleName, target) {
+  const {
+    Targets
+  } = await cloudWatchEvents.listTargetsByRule({
+    Rule: ruleName
+  }).promise();
+
+  if (!Targets.find(_target => isEqual(_target, target))) {
+    const params = {
+      Rule: ruleName,
+      Targets: [target]
+    };
+    await cloudWatchEvents.putTargets(params).promise();
+
+    return true;
+  }
+}
+
 export function coloredStatusText(envColor, text) {
   if (envColor === 'Green') {
     return chalk.green(text);
@@ -243,4 +386,68 @@ export function coloredStatusText(envColor, text) {
     return chalk.red(text);
   }
   return text;
+}
+
+
+// Checks if it is safe to use the environment variables from s3
+export function checkLongEnvSafe(currentConfig, commandHistory, appConfig) {
+  const optionEnabled = appConfig.longEnvVars;
+  const previouslyMigrated = currentConfig[0].OptionSettings.find(({ Namespace, OptionName }) => Namespace === 'aws:elasticbeanstalk:application:environment' &&
+      OptionName === 'MUP_ENV_FILE_VERSION');
+  const reconfigCount = commandHistory.filter(({ name }) => name === 'beanstalk.reconfig').length;
+  const ranDeploy = commandHistory.find(({ name }) => name === 'beanstalk.deploy') && reconfigCount > 1;
+
+  return {
+    migrated: previouslyMigrated,
+    safeToReconfig: optionEnabled && (previouslyMigrated || ranDeploy),
+    enabled: optionEnabled
+  };
+}
+
+export function createVersionDescription(api, appConfig) {
+  const appPath = api.resolvePath(api.getBasePath(), appConfig.path);
+  let description = '';
+
+  try {
+    description = execSync('git log -1 --pretty=%B', {
+      cwd: appPath,
+      stdio: 'pipe'
+    }).toString();
+  } catch (e) {
+    description = `Deployed by Mup on ${new Date().toUTCString()}`;
+  }
+  return description.split('\n')[0].slice(0, 195);
+}
+
+export async function ensureSsmDocument(name, content) {
+  let exists = true;
+  let needsUpdating = false;
+
+  try {
+    const result = await ssm.getDocument({ Name: name, DocumentVersion: '$LATEST' }).promise();
+    // If the document was created or edited on the AWS console, there is extra new
+    // line characters and whitespace
+    const currentContent = JSON.stringify(JSON.parse(result.Content.replace(/\r?\n|\r/g, '')));
+    if (currentContent !== content) {
+      needsUpdating = true;
+    }
+  } catch (e) {
+    exists = false;
+  }
+
+  if (!exists) {
+    await ssm.createDocument({
+      Content: content,
+      Name: name,
+      DocumentType: 'Automation'
+    }).promise();
+
+    return true;
+  } else if (needsUpdating) {
+    await ssm.updateDocument({
+      Content: content,
+      Name: name,
+      DocumentVersion: '$LATEST'
+    }).promise();
+  }
 }

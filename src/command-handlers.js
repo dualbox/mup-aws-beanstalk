@@ -3,45 +3,68 @@ import {
   acm,
   s3,
   beanstalk,
-  autoScaling
+  autoScaling,
+  cloudTrail
 } from './aws';
-import upload from './upload';
+import updateSSLConfig from './certificates';
+import {
+  rolePolicy,
+  trailBucketPolicy,
+  DeregisterEvent,
+  deregisterEventTarget,
+  serviceRole,
+  eventTargetRolePolicy,
+  eventTargetRole,
+  gracefulShutdownAutomationDocument,
+  passRolePolicy
+} from './policies';
+import upload, { uploadEnvFile } from './upload';
 import {
   archiveApp,
   injectFiles
 } from './prepare-bundle';
 import {
   coloredStatusText,
+  ensureBucketExists,
   ensureInstanceProfileExists,
   ensureRoleExists,
   ensureRoleAdded,
   ensurePoliciesAttached,
+  ensureBucketPolicyAttached,
+  getAccountId,
   getLogs,
   logStep,
   names,
   tmpBuildPath,
-  shouldRebuild
+  shouldRebuild,
+  ensureCloudWatchRule,
+  ensureRuleTargetExists,
+  ensureInlinePolicyAttached,
+  findBucketWithPrefix,
+  createUniqueName,
+  checkLongEnvSafe,
+  createVersionDescription,
+  ensureSsmDocument
 } from './utils';
 import {
   largestVersion,
+  largestEnvVersion,
   ebVersions,
-  oldVersions
+  oldVersions,
+  oldEnvVersions
 } from './versions';
 
 import {
   createDesiredConfig,
   diffConfig,
   scalingConfig,
-  scalingConfigChanged,
-  mergeConfigs
+  scalingConfigChanged
 } from './eb-config';
 
 import {
   waitForEnvReady,
   waitForHealth
 } from './env-ready';
-
-import updateSSLConfig from './certificates';
 
 export async function setup(api) {
   const config = api.getConfig();
@@ -51,7 +74,15 @@ export async function setup(api) {
     bucket: bucketName,
     app: appName,
     instanceProfile,
-    serviceRole
+    serviceRole: serviceRoleName,
+    trailBucketPrefix,
+    trailName,
+    deregisterRuleName,
+    environment: environmentName,
+    eventTargetRole: eventTargetRoleName,
+    eventTargetPolicyName,
+    eventTargetPassRoleName,
+    automationDocument
   } = names(config);
 
   logStep('=> Setting up');
@@ -61,31 +92,41 @@ export async function setup(api) {
     Buckets
   } = await s3.listBuckets().promise();
 
-  if (!Buckets.find(bucket => bucket.Name === bucketName)) {
-    await s3.createBucket({
-      Bucket: bucketName
-    }).promise();
+  const beanstalkBucketCreated = await ensureBucketExists(Buckets, bucketName, appConfig.region);
+
+  if (beanstalkBucketCreated) {
     console.log('  Created Bucket');
   }
 
   logStep('=> Ensuring IAM Roles and Instance Profiles are setup');
 
   // Create role and instance profile
-  await ensureRoleExists(config, instanceProfile, '{ "Version": "2008-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "Service": "ec2.amazonaws.com" }, "Action": "sts:AssumeRole" } ] }');
+  await ensureRoleExists(instanceProfile, rolePolicy);
   await ensureInstanceProfileExists(config, instanceProfile);
   await ensurePoliciesAttached(config, instanceProfile, [
     'arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier',
     'arn:aws:iam::aws:policy/AWSElasticBeanstalkMulticontainerDocker',
-    'arn:aws:iam::aws:policy/AWSElasticBeanstalkWorkerTier'
+    'arn:aws:iam::aws:policy/AWSElasticBeanstalkWorkerTier',
+    ...appConfig.gracefulShutdown ? ['arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'] : []
   ]);
   await ensureRoleAdded(config, instanceProfile, instanceProfile);
 
   // Create role used by enhanced health
-  await ensureRoleExists(config, serviceRole, '{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "Service": "elasticbeanstalk.amazonaws.com" }, "Action": "sts:AssumeRole", "Condition": { "StringEquals": { "sts:ExternalId": "elasticbeanstalk" } } } ] }');
-  await ensurePoliciesAttached(config, serviceRole, [
+  await ensureRoleExists(serviceRoleName, serviceRole);
+  await ensurePoliciesAttached(config, serviceRoleName, [
     'arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth',
     'arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkService'
   ]);
+
+  if (appConfig.gracefulShutdown) {
+    const accountId = await getAccountId();
+    const policy = eventTargetRolePolicy(accountId, environmentName, appConfig.region || 'us-east-1');
+    const passPolicy = passRolePolicy(accountId, eventTargetRoleName);
+
+    await ensureRoleExists(eventTargetRoleName, eventTargetRole, true);
+    await ensureInlinePolicyAttached(eventTargetRoleName, eventTargetPolicyName, policy);
+    await ensureInlinePolicyAttached(eventTargetRoleName, eventTargetPassRoleName, passPolicy);
+  }
 
   // Create beanstalk application if needed
   const {
@@ -100,6 +141,67 @@ export async function setup(api) {
 
     await beanstalk.createApplication(params).promise();
     console.log('  Created Beanstalk application');
+  }
+
+  if (appConfig.gracefulShutdown) {
+    logStep('=> Ensuring Graceful Shutdown is setup');
+
+    const existingBucket = findBucketWithPrefix(Buckets, trailBucketPrefix);
+    const trailBucketName = existingBucket ?
+      existingBucket.Name :
+      createUniqueName(trailBucketPrefix);
+    const region = appConfig.region || 'us-east-1';
+    const accountId = await getAccountId();
+    const policy = trailBucketPolicy(accountId, trailBucketName);
+
+    const trailBucketCreated = await ensureBucketExists(Buckets, trailBucketName, appConfig.region);
+    await ensureBucketPolicyAttached(trailBucketName, policy);
+
+    if (trailBucketCreated) {
+      console.log('  Created bucket for Cloud Trail');
+    }
+
+    const params = {
+      trailNameList: [
+        trailName
+      ]
+    };
+
+    const {
+      trailList
+    } = await cloudTrail.describeTrails(params).promise();
+
+    if (trailList.length === 0) {
+      const createParams = {
+        Name: trailName,
+        S3BucketName: trailBucketName
+      };
+
+      await cloudTrail.createTrail(createParams).promise();
+
+      console.log('  Created CloudTrail trail');
+    }
+
+    const createdDocument = await ensureSsmDocument(
+      automationDocument,
+      gracefulShutdownAutomationDocument()
+    );
+    if (createdDocument) {
+      console.log('  Created SSM Automation Document');
+    }
+
+    const createdRule = await ensureCloudWatchRule(deregisterRuleName, 'Used by Meteor Up for graceful shutdown', DeregisterEvent);
+
+    if (createdRule) {
+      console.log('  Created Cloud Watch rule');
+    }
+
+    const target = deregisterEventTarget(environmentName, eventTargetRoleName, accountId, region);
+    const createdTarget = await ensureRuleTargetExists(deregisterRuleName, target, accountId);
+
+    if (createdTarget) {
+      console.log('  Created target for Cloud Watch rule');
+    }
   }
 }
 
@@ -131,9 +233,7 @@ export async function deploy(api) {
       api,
       app,
       nextVersion,
-      config.app.yumPackages,
-      config.app.forceSSL,
-      config.app.buildOptions.buildLocation
+      config.app
     );
     await archiveApp(config.app.buildOptions.buildLocation, api);
   }
@@ -148,7 +248,7 @@ export async function deploy(api) {
   await beanstalk.createApplicationVersion({
     ApplicationName: app,
     VersionLabel: nextVersion.toString(),
-    Description: `Deployed by Mup on ${new Date().toUTCString()}`,
+    Description: createVersionDescription(api, config.app),
     SourceBundle: {
       S3Bucket: bucket,
       S3Key: key
@@ -178,6 +278,24 @@ export async function deploy(api) {
   await api.runCommand('beanstalk.clean');
 
   await api.runCommand('beanstalk.ssl');
+
+  if (config.app.longEnvVars) {
+    const {
+      ConfigurationSettings
+    } = await beanstalk.describeConfigurationSettings({
+      EnvironmentName: environment,
+      ApplicationName: app
+    }).promise();
+
+    const {
+      migrated
+    } = checkLongEnvSafe(ConfigurationSettings, api.commandHistory, config.app);
+
+    if (!migrated) {
+      // We know the bundle now supports longEnvVars, so it is safe to migrate
+      await api.runCommand('beanstalk.reconfig');
+    }
+  }
 }
 
 export async function logs(api) {
@@ -187,7 +305,6 @@ export async function logs(api) {
     data,
     instance
   }) => {
-    // console.log(data);
     data = data.split('-------------------------------------\n/var/log/');
     process.stdout.write(`${instance} `);
     process.stdout.write(data[1]);
@@ -295,13 +412,15 @@ export async function restart(api) {
 export async function clean(api) {
   const config = api.getConfig();
   const {
-    app
+    app,
+    bucket
   } = names(config);
 
   logStep('=> Finding old versions');
   const {
     versions
   } = await oldVersions(api);
+  const envVersions = await oldEnvVersions(api);
 
   logStep('=> Removing old versions');
 
@@ -314,6 +433,13 @@ export async function clean(api) {
     }).promise());
   }
 
+  for (let i = 0; i < envVersions.length; i++) {
+    promises.push(s3.deleteObject({
+      Bucket: bucket,
+      Key: `env/${envVersions[i]}.txt`
+    }).promise());
+  }
+
   // TODO: remove bundles
 
   await Promise.all(promises);
@@ -323,7 +449,8 @@ export async function reconfig(api) {
   const config = api.getConfig();
   const {
     app,
-    environment
+    environment,
+    bucket
   } = names(config);
 
   logStep('=> Configuring Beanstalk Environment');
@@ -336,17 +463,20 @@ export async function reconfig(api) {
     EnvironmentNames: [environment]
   }).promise();
 
-  const desiredEbConfig = createDesiredConfig(api.getConfig(), '', api);
-  const customEbConfig = (config.app.customBeanstalkConfig || []).map(option => ({
-    Namespace: option.namespace,
-    OptionName: option.option,
-    Value: option.value
-  }));
-
-  desiredEbConfig.OptionSettings = mergeConfigs(desiredEbConfig.OptionSettings, customEbConfig);
-
   if (!Environments.find(env => env.Status !== 'Terminated')) {
-    const { SolutionStacks } = await beanstalk.listAvailableSolutionStacks().promise();
+    const desiredEbConfig = createDesiredConfig(
+      api.getConfig(),
+      api.getSettings(),
+      config.app.longEnvVars ? 1 : false
+    );
+
+    if (config.app.longEnvVars) {
+      await uploadEnvFile(bucket, 1, config.app.env, api.getSettings());
+    }
+
+    const {
+      SolutionStacks
+    } = await beanstalk.listAvailableSolutionStacks().promise();
     const solutionStack = SolutionStacks.find(name => name.endsWith('running Node.js'));
 
     const [version] = await ebVersions(api);
@@ -369,12 +499,35 @@ export async function reconfig(api) {
       ApplicationName: app
     }).promise();
     const {
+      enabled: longEnvEnabled,
+      safeToReconfig
+    } = checkLongEnvSafe(ConfigurationSettings, api.commandHistory, config.app);
+    let nextEnvVersion = 0;
+    if (safeToReconfig) {
+      const currentEnvVersion = await largestEnvVersion(api);
+      nextEnvVersion = currentEnvVersion + 1;
+    }
+    const desiredEbConfig = createDesiredConfig(
+      api.getConfig(),
+      api.getSettings(),
+      safeToReconfig ? nextEnvVersion : 0
+    );
+    const {
       toRemove,
       toUpdate
     } = diffConfig(
       ConfigurationSettings[0].OptionSettings,
       desiredEbConfig.OptionSettings
     );
+
+    if (longEnvEnabled) {
+      await uploadEnvFile(bucket, nextEnvVersion, config.app.env, api.getSettings());
+      if (!safeToReconfig) {
+        // Reconfig will be run again after deploy to migrate.
+        // This way we know the bundle includes the necessary files
+        return;
+      }
+    }
 
     if (toRemove.length > 0 || toUpdate.length > 0) {
       await beanstalk.updateEnvironment({
@@ -494,15 +647,21 @@ export async function ssl(api) {
   logStep('=> Checking Certificate Status');
 
   const domains = config.app.sslDomains;
-  const { CertificateSummaryList } = await acm.listCertificates().promise();
+  const {
+    CertificateSummaryList
+  } = await acm.listCertificates().promise();
   let found = null;
 
   for (let i = 0; i < CertificateSummaryList.length; i++) {
-    const { DomainName, CertificateArn } = CertificateSummaryList[i];
+    const {
+      DomainName,
+      CertificateArn
+    } = CertificateSummaryList[i];
 
     if (DomainName === domains[0]) {
-      // eslint-disable-next-line no-await-in-loop
-      const { Certificate } = await acm.describeCertificate({
+      const {
+        Certificate
+      } = await acm.describeCertificate({ // eslint-disable-line no-await-in-loop
         CertificateArn
       }).promise();
 
@@ -535,11 +694,17 @@ export async function ssl(api) {
 
   /* eslint-disable no-await-in-loop */
   while (!emailsProvided && checks < 5) {
-    const { Certificate } = await acm.describeCertificate({
+    const {
+      Certificate
+    } = await acm.describeCertificate({
       CertificateArn: certificateArn
     }).promise();
+    const validationOptions = Certificate.DomainValidationOptions[0];
 
-    if (Certificate.DomainValidationOptions[0].ValidationEmails.length > 0 || checks === 6) {
+    if (typeof validationOptions.ValidationEmails === 'undefined') {
+      emailsProvided = true;
+      certificate = Certificate;
+    } else if (validationOptions.ValidationEmails.length > 0 || checks === 6) {
       emailsProvided = true;
       certificate = Certificate;
     } else {
@@ -554,21 +719,25 @@ export async function ssl(api) {
   if (certificate.Status === 'PENDING_VALIDATION') {
     console.log('Certificate is pending validation.');
     certificate.DomainValidationOptions.forEach(({
+      DomainName,
       ValidationEmails,
       ValidationDomain,
       ValidationStatus
     }) => {
       if (ValidationStatus === 'SUCCESS') {
-        console.log(chalk.green(`${ValidationDomain} has been verified`));
+        console.log(chalk.green(`${ValidationDomain || DomainName} has been verified`));
         return;
       }
 
-      console.log(chalk.yellow(`${ValidationDomain} is pending validation`));
-      console.log('Emails with instructions have been sent to:');
+      console.log(chalk.yellow(`${ValidationDomain || DomainName} is pending validation`));
 
-      ValidationEmails.forEach((email) => {
-        console.log(`  ${email}`);
-      });
+      if (ValidationEmails) {
+        console.log('Emails with instructions have been sent to:');
+
+        ValidationEmails.forEach((email) => {
+          console.log(`  ${email}`);
+        });
+      }
 
       console.log('Run "mup beanstalk ssl" after you have verified the domains, or to check the verification status');
     });
