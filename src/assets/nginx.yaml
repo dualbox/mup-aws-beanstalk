@@ -4,7 +4,7 @@ files:
         owner: root
         group: users
         content: |
-          client_max_body_size 30M;
+          client_max_body_size 50M;
           proxy_buffer_size 128k;
           proxy_buffers 4 256k;
           proxy_busy_buffers_size 256k;
@@ -37,6 +37,16 @@ files:
               return 301 https://$host$request_uri;
             }
             <% } %>
+
+            location ~* /packages/.+\.(eot|ttf|woff)$ {
+              root /var/app/current/programs/web.browser;
+              access_log off;
+              add_header Access-Control-Allow-Origin *;
+              add_header Vary Origin;
+              add_header Pragma public;
+              add_header Cache-Control "public";
+              expires max;
+            }
 
             location ~* \.(eot|ttf|woff)$ {
               root /var/app/current/programs/web.browser/app;
